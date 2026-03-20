@@ -10,6 +10,12 @@ Downloads the latest NVIDIA Gaming driver from a private S3 bucket and silently 
 
 ## Usage
 
+**Run directly (one-liner):**
+```powershell
+irm https://raw.githubusercontent.com/phantom-computer/scripts-and-utilities/main/nvidia-driver-install/Install-NvidiaDriver.ps1 | iex
+```
+
+**Or download and run manually:**
 ```powershell
 .\Install-NvidiaDriver.ps1
 ```
