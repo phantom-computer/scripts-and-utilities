@@ -143,7 +143,7 @@ for term in data.get('terms',{}).get('OnDemand',{}).values():
 
 # ── CloudTrail: build runtime hours per instance type ─────────────────────────
 build_runtime() {
-  local instance_id="$1" cur_type="$2" cur_state="$3" launch_time="$4"
+  local instance_id="$1" cur_type="$2" cur_state="$3"
 
   # Lookback 90 days before month start
   local lookback
@@ -175,36 +175,43 @@ build_runtime() {
     [[ -z "$next_token" ]] && break
   done
 
-  # Parse events, filter relevant ones, sort by time, reconstruct timeline
-  python3 - "$instance_id" "$cur_type" "$cur_state" "$PERIOD_START" "$PERIOD_END" "$launch_time" << 'PYEOF'
+  # Parse events, reconstruct timeline via embedded Python
+  python3 - "$instance_id" "$cur_type" "$cur_state" "$PERIOD_START" "$PERIOD_END" \
+    <<'PYEOF_INNER'
 import json, sys
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 instance_id, cur_type, cur_state = sys.argv[1], sys.argv[2], sys.argv[3]
-start       = datetime.fromisoformat(sys.argv[4].replace("Z","+00:00"))
-end         = datetime.fromisoformat(sys.argv[5].replace("Z","+00:00"))
-launch_time = datetime.fromisoformat(sys.argv[6])
-if launch_time.tzinfo is None:
-    launch_time = launch_time.replace(tzinfo=timezone.utc)
-launch_time = launch_time.astimezone(timezone.utc)
+start = datetime.fromisoformat(sys.argv[4].replace("Z","+00:00"))
+end   = datetime.fromisoformat(sys.argv[5].replace("Z","+00:00"))
 
 raw = sys.stdin.read().strip()
 events_raw = json.loads(raw) if raw else []
 
-relevant = {"StartInstances","StopInstances","TerminateInstances","ModifyInstanceAttribute"}
+relevant = {"RunInstances","StartInstances","StopInstances","TerminateInstances","ModifyInstanceAttribute"}
 
 def to_utc(ts_str):
     dt = datetime.fromisoformat(ts_str) if isinstance(ts_str, str) else ts_str
     if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
+# Find creation time and original instance type from RunInstances event
+creation_time = None
+initial_type  = None
+for e in sorted(events_raw, key=lambda x: x["EventTime"]):
+    if e.get("EventName") == "RunInstances":
+        creation_time = to_utc(e["EventTime"])
+        detail        = json.loads(e.get("CloudTrailEvent","{}"))
+        initial_type  = (detail.get("requestParameters") or {}).get("instanceType")
+        break
+
 timeline = []
 for e in events_raw:
     name = e.get("EventName","")
     if name not in relevant: continue
-    ts = to_utc(e["EventTime"])
+    ts     = to_utc(e["EventTime"])
     detail = json.loads(e.get("CloudTrailEvent","{}"))
-    if name == "StartInstances":
+    if name in ("RunInstances","StartInstances"):
         timeline.append((ts, "start", None))
     elif name in ("StopInstances","TerminateInstances"):
         timeline.append((ts, "stop", None))
@@ -217,35 +224,35 @@ timeline.sort(key=lambda x: x[0])
 
 ct = cur_type
 
-# If the instance launched after month start, it couldn't have been running
-# at month start — use LaunchTime as the effective period start and treat
-# the instance as stopped until we see the first StartInstances event.
-if launch_time > start:
-    effective_start = launch_time
+if creation_time and creation_time > start:
+    # Instance created this month — billing starts at creation, not month start.
+    # Use type from RunInstances so pre-upgrade sessions are priced correctly.
+    effective_start = creation_time
     cur_running     = False
+    if initial_type:
+        ct = initial_type
 else:
-    # Replay pre-month events to establish state at month start.
-    # Fall back to current_state only for instances older than our
-    # 90-day CloudTrail lookback window.
+    # Instance existed before this month — replay pre-month events.
+    # Fall back to current_state only for instances older than 90-day lookback.
     effective_start = start
     cur_running     = (cur_state == "running")
     for ts, action, val in timeline:
         if ts >= start: break
-        if action == "start": cur_running = True
-        elif action == "stop": cur_running = False
+        if action == "start":        cur_running = True
+        elif action == "stop":       cur_running = False
         elif action == "type_change": ct = val
 
 hours_by_type = {}
 cur_ts = effective_start
 for ts, action, val in timeline:
     if ts < effective_start: continue
-    if ts >= end: break
+    if ts >= end:            break
     if cur_running:
         delta = (ts - cur_ts).total_seconds() / 3600
         hours_by_type[ct] = hours_by_type.get(ct, 0.0) + delta
     cur_ts = ts
-    if action == "start": cur_running = True
-    elif action == "stop": cur_running = False
+    if action == "start":        cur_running = True
+    elif action == "stop":       cur_running = False
     elif action == "type_change": ct = val
 
 if cur_running:
@@ -254,7 +261,7 @@ if cur_running:
 
 for itype, hours in sorted(hours_by_type.items()):
     print(f"{itype} {hours:.4f}")
-PYEOF
+PYEOF_INNER
 }
 
 # ── Egress ────────────────────────────────────────────────────────────────────
@@ -314,14 +321,13 @@ report_instance() {
     --query 'Reservations[0].Instances[0]' \
     --output json 2>/dev/null)
 
-  local cur_type cur_state platform name owner inst_uuid launch_time
+  local cur_type cur_state platform name owner inst_uuid
   cur_type=$(echo "$inst_json" | jq -r '.InstanceType')
   cur_state=$(echo "$inst_json" | jq -r '.State.Name')
   platform=$(echo "$inst_json" | jq -r '.Platform // "linux"')
   name=$(echo "$inst_json" | jq -r '(.Tags // []) | map(select(.Key=="Name")) | .[0].Value // "'$instance_id'"')
   owner=$(echo "$inst_json" | jq -r '(.Tags // []) | map(select(.Key=="Owner")) | .[0].Value // "—"')
   inst_uuid=$(echo "$inst_json" | jq -r '(.Tags // []) | map(select(.Key=="InstanceUUID")) | .[0].Value // "—"')
-  launch_time=$(echo "$inst_json" | jq -r '.LaunchTime')
 
   local os_type="${OS_OVERRIDE:-$platform}"
 
@@ -340,7 +346,7 @@ report_instance() {
 
   local total_runtime_cost=0
   local runtime_lines
-  runtime_lines=$(build_runtime "$instance_id" "$cur_type" "$cur_state" "$launch_time" <<< "")
+  runtime_lines=$(build_runtime "$instance_id" "$cur_type" "$cur_state" <<< "")
 
   while IFS=' ' read -r itype hours; do
     [[ -z "$itype" ]] && continue

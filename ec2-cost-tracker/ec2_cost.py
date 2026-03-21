@@ -142,18 +142,21 @@ def get_instance_type_price(pricing_client, instance_type, region, os_type):
 
 # ── Core calculations ─────────────────────────────────────────────────────────
 
-def build_runtime_by_type(instance_id, current_type, current_state, launch_time, start, end, region):
+def build_runtime_by_type(instance_id, current_type, current_state, start, end, region):
     """
     Reconstruct running hours per instance type using CloudTrail.
 
-    launch_time is used as a hard floor: hours are never counted before the
-    instance was created, even if no pre-month CloudTrail events exist.
+    Uses the RunInstances event as the instance creation floor so billing
+    never starts before the instance existed. Handles mid-month type changes
+    via ModifyInstanceAttribute. Falls back to current_state for instances
+    older than the 90-day CloudTrail lookback window.
     """
     ct = boto3.client("cloudtrail", region_name=region)
     lookback_start = start - timedelta(days=90)
     all_events = get_cloudtrail_events(ct, instance_id, lookback_start, end)
 
-    relevant = {"StartInstances", "StopInstances", "TerminateInstances", "ModifyInstanceAttribute"}
+    relevant = {"RunInstances", "StartInstances", "StopInstances",
+                "TerminateInstances", "ModifyInstanceAttribute"}
     events = sorted(
         [e for e in all_events if e["EventName"] in relevant],
         key=lambda e: e["EventTime"]
@@ -164,7 +167,15 @@ def build_runtime_by_type(instance_id, current_type, current_state, launch_time,
             return ts.replace(tzinfo=timezone.utc)
         return ts.astimezone(timezone.utc)
 
-    launch_time_utc = to_utc(launch_time)
+    # Find creation time and original instance type from RunInstances
+    creation_time  = None
+    initial_type   = None
+    for e in events:
+        if e["EventName"] == "RunInstances":
+            creation_time = to_utc(e["EventTime"])
+            detail        = json.loads(e["CloudTrailEvent"])
+            initial_type  = (detail.get("requestParameters") or {}).get("instanceType")
+            break
 
     timeline = []
     for e in events:
@@ -172,7 +183,7 @@ def build_runtime_by_type(instance_id, current_type, current_state, launch_time,
         ts     = to_utc(e["EventTime"])
         detail = json.loads(e["CloudTrailEvent"])
 
-        if name == "StartInstances":
+        if name in ("RunInstances", "StartInstances"):
             timeline.append((ts, "start", None))
         elif name in ("StopInstances", "TerminateInstances"):
             timeline.append((ts, "stop", None))
@@ -184,16 +195,17 @@ def build_runtime_by_type(instance_id, current_type, current_state, launch_time,
 
     cur_type = current_type
 
-    # If the instance launched after the month start, it couldn't have been
-    # running at month start — use LaunchTime as the effective period start and
-    # treat the instance as stopped until we see a StartInstances event.
-    if launch_time_utc > start:
-        effective_start = launch_time_utc
+    if creation_time and creation_time > start:
+        # Instance was created this month — billing starts at creation, not month start.
+        # Use the type from RunInstances so pre-upgrade sessions are priced correctly.
+        effective_start = creation_time
         cur_running     = False
+        if initial_type:
+            cur_type = initial_type
     else:
-        # Replay pre-month events to establish state at month start.
-        # Fall back to current_state only for instances older than our
-        # 90-day CloudTrail lookback window.
+        # Instance existed before this month — replay pre-month events to establish
+        # the correct state and type at month start. Fall back to current_state only
+        # for instances older than the 90-day CloudTrail lookback window.
         effective_start = start
         cur_running     = current_state == "running"
         for ts, action, val in timeline:
@@ -208,6 +220,28 @@ def build_runtime_by_type(instance_id, current_type, current_state, launch_time,
 
     hours_by_type = {}
     cur_ts = effective_start
+
+    for ts, action, val in timeline:
+        if ts < effective_start:
+            continue
+        if ts >= end:
+            break
+        if cur_running:
+            delta = (ts - cur_ts).total_seconds() / 3600
+            hours_by_type[cur_type] = hours_by_type.get(cur_type, 0.0) + delta
+        cur_ts = ts
+        if action == "start":
+            cur_running = True
+        elif action == "stop":
+            cur_running = False
+        elif action == "type_change":
+            cur_type = val
+
+    if cur_running:
+        delta = (end - cur_ts).total_seconds() / 3600
+        hours_by_type[cur_type] = hours_by_type.get(cur_type, 0.0) + delta
+
+    return hours_by_type
 
     for ts, action, val in timeline:
         if ts < start:
@@ -277,7 +311,6 @@ def report_instance(inst, start, end, region, os_override, pricing_client):
     name          = get_tag(inst, "Name", instance_id)
     owner         = get_tag(inst, "Owner", "—")
     inst_uuid     = get_tag(inst, "InstanceUUID", "—")
-    launch_time   = inst["LaunchTime"]
 
     print(f"\n{'='*68}")
     print(f"  {name}  ({instance_id})")
@@ -293,7 +326,7 @@ def report_instance(inst, start, end, region, os_override, pricing_client):
     print(f"  {'Instance Type':<22} {'Hours':>8}  {'Rate':>14}  {'Cost':>10}")
     print(f"  {'-'*22} {'-'*8}  {'-'*14}  {'-'*10}")
     hours_by_type = build_runtime_by_type(
-        instance_id, current_type, current_state, launch_time, start, end, region
+        instance_id, current_type, current_state, start, end, region
     )
     total_runtime_cost = 0.0
     for itype, hours in sorted(hours_by_type.items()):
