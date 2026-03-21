@@ -9,6 +9,9 @@ Downloads the latest NVIDIA Gaming driver from a private S3 bucket, silently ins
 - Run PowerShell **as Administrator**
 - If using a custom Windows AMI, it must be Sysprep'd
 
+## Setup
+
+
 ## Usage
 
 **Run directly (one-liner):**
