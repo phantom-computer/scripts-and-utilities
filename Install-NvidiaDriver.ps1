@@ -1,7 +1,9 @@
 # Install-NvidiaDriver.ps1
 # Downloads the latest NVIDIA Gaming driver from S3 and silently installs it.
+#
+# Set $Bucket and $KeyPrefix to match your S3 layout before running.
 
-$Bucket    = "nvidia-gaming"
+$Bucket    = "<your-s3-bucket>"
 $KeyPrefix = "windows/latest"
 $LocalPath = "$home\Desktop\NVIDIA"
 

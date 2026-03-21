@@ -40,7 +40,7 @@ pricing:GetProducts
 python3 ec2_cost.py --instance-id i-0abc1234567890
 
 # All instances by Owner tag (UUID)
-python3 ec2_cost.py --tag-value 94682438-4091-706e-4193-1b79bdc3d3da
+python3 ec2_cost.py --tag-value <owner-uuid>
 
 # Custom tag key
 python3 ec2_cost.py --tag-key user_id --tag-value <uuid>
@@ -58,7 +58,7 @@ chmod +x ec2_cost.sh
 ./ec2_cost.sh --instance-id i-0abc1234567890
 
 # All instances by Owner tag (UUID)
-./ec2_cost.sh --tag-value 94682438-4091-706e-4193-1b79bdc3d3da
+./ec2_cost.sh --tag-value <owner-uuid>
 
 # Custom tag key
 ./ec2_cost.sh --tag-key user_id --tag-value <uuid>
@@ -69,14 +69,14 @@ chmod +x ec2_cost.sh
 
 ## Tag filtering
 
-Both scripts default `--tag-key` to `Owner`, which is the UUID-based user tag on instances in this account. Override with `--tag-key` to match any tag:
+Both scripts default `--tag-key` to `Owner`, which is the UUID-based user tag on instances. Override with `--tag-key` to match any tag:
 
 ```bash
 # By Owner (default)
-./ec2_cost.sh --tag-value 94682438-4091-706e-4193-1b79bdc3d3da
+./ec2_cost.sh --tag-value <owner-uuid>
 
 # By InstanceUUID
-./ec2_cost.sh --tag-key InstanceUUID --tag-value 2b12bd67-8386-44ba-baa6-8e990dc11fe9
+./ec2_cost.sh --tag-key InstanceUUID --tag-value <instance-uuid>
 ```
 
 When `--tag-value` matches multiple instances, each gets its own breakdown and a combined total is printed at the end.
@@ -84,22 +84,22 @@ When `--tag-value` matches multiple instances, each gets its own breakdown and a
 ## Example output
 
 ```
-Found 2 instance(s) with Owner=94682438-4091-706e-4193-1b79bdc3d3da
+Found 2 instance(s) with Owner=<owner-uuid>
 
 ====================================================================
-  HOCH1  (i-0f1b698d1c60a1f02)
-  Owner : 94682438-4091-706e-4193-1b79bdc3d3da
-  UUID  : 2b12bd67-8386-44ba-baa6-8e990dc11fe9
-  State : running    | Type: g7e.2xlarge       | OS: linux
+  my-instance  (i-0abc1234567890)
+  Owner : <owner-uuid>
+  UUID  : <instance-uuid>
+  State : running    | Type: g6e.2xlarge       | OS: linux
   Period: 2026-03-01 → 2026-03-20T19:00:00Z
 ====================================================================
 
 RUNTIME
   Instance Type          Hours            Rate        Cost
   ---------------------- --------  --------------  ----------
-  g7e.2xlarge              456.00    $2.2950/hr     $ 1046.52
+  g6e.2xlarge              312.00    $0.8480/hr     $  264.58
   ---------------------- --------  --------------  ----------
-  TOTAL                                             $ 1046.52
+  TOTAL                                             $  264.58
 
 EGRESS (NetworkOut)
   Total transfer :     243.817 GB
@@ -110,20 +110,20 @@ EGRESS (NetworkOut)
 EBS STORAGE
   Volume ID                Type     Size           Rate        Cost
   ------------------------ -------- --------  -------------  ----------
-  vol-0abc123              gp3       200 GB  $0.080/GB-mo   $   16.00
+  vol-0abc123              gp3       500 GB  $0.080/GB-mo   $   40.00
   ------------------------ -------- --------  -------------  ----------
-  TOTAL                                                      $   16.00
+  TOTAL                                                      $   40.00
 
-  Runtime  :    $ 1046.52
+  Runtime  :    $  264.58
   Egress   :    $   12.94
-  EBS      :    $   16.00
+  EBS      :    $   40.00
   --------------------------------------
-  TOTAL    :    $ 1075.46
+  TOTAL    :    $  317.52
 
 ####################################################################
-  ACCOUNT TOTAL for Owner=94682438-4091-706e-4193-1b79bdc3d3da
+  ACCOUNT TOTAL for Owner=<owner-uuid>
   2 instance(s)  |  2026-03
-  TOTAL :  $ 1823.91
+  TOTAL :  $  635.04
 ####################################################################
 ```
 
