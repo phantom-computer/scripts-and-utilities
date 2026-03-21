@@ -254,8 +254,19 @@ def build_runtime_by_type(instance_id, current_type, current_state, start, end, 
             cur_type = val
 
     if cur_running:
-        delta = (end - cur_ts).total_seconds() / 3600
-        hours_by_type[cur_type] = hours_by_type.get(cur_type, 0.0) + delta
+        if current_state == "running":
+            # Instance is still running — count up to end of period.
+            delta = (end - cur_ts).total_seconds() / 3600
+            hours_by_type[cur_type] = hours_by_type.get(cur_type, 0.0) + delta
+        else:
+            # Instance is stopped but no StopInstances event exists in CloudTrail.
+            # This happens when the OS initiates shutdown (e.g. Windows shut down
+            # from within), which stops the instance without an EC2 API call.
+            # We know it stopped but not when — don't count the trailing segment.
+            warnings.append(
+                f"  [warn] No StopInstances event found after {cur_ts.strftime('%Y-%m-%d %H:%M UTC')}; "
+                f"instance is stopped but stop time is unknown — trailing segment not counted"
+            )
 
     for w in warnings:
         print(w, file=__import__('sys').stderr)

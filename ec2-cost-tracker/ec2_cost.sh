@@ -272,11 +272,21 @@ for ts, action, val in timeline:
             cur_ts = ts
         ct = val
 
-if cur_running:
-    delta = (end - cur_ts).total_seconds() / 3600
-    hours_by_type[ct] = hours_by_type.get(ct, 0.0) + delta
-
 import sys
+if cur_running:
+    if cur_state == "running":
+        # Instance is still running — count up to end of period.
+        delta = (end - cur_ts).total_seconds() / 3600
+        hours_by_type[ct] = hours_by_type.get(ct, 0.0) + delta
+    else:
+        # Instance is stopped but no StopInstances event in CloudTrail.
+        # Happens when OS initiates shutdown (e.g. Windows shut down from within).
+        # We know it stopped but not when — don't count the trailing segment.
+        warnings.append(
+            f"  [warn] No StopInstances after {cur_ts.strftime('%Y-%m-%d %H:%M UTC')}; "
+            f"instance is stopped but stop time unknown — trailing segment not counted"
+        )
+
 for w in warnings: print(w, file=sys.stderr)
 
 for itype, hours in sorted(hours_by_type.items()):
