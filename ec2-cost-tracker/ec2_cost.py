@@ -97,7 +97,7 @@ def get_tag(instance, key, default=""):
 def get_cloudtrail_events(ct_client, instance_id, start, end):
     events = []
     kwargs = {
-        "LookupAttributes": [{"AttributeKey": "ResourceName", "Value": instance_id}],
+        "LookupAttributes": [{"AttributeKey": "ResourceName", "AttributeValue": instance_id}],
         "StartTime": start,
         "EndTime": end,
         "MaxResults": 50,
