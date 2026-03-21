@@ -1,12 +1,13 @@
 # NVIDIA Driver Installer
 
-Downloads the latest NVIDIA Gaming driver from a private S3 bucket and silently installs it on Windows.
+Downloads the latest NVIDIA Gaming driver from a private S3 bucket, silently installs it, registers the GridSwCert license, and reboots.
 
 ## Prerequisites
 
-- [AWS Tools for PowerShell](https://aws.amazon.com/powershell/) installed and configured
+- [AWS Tools for PowerShell](https://aws.amazon.com/powershell/) installed and configured with default credentials
 - IAM credentials with `s3:GetObject` and `s3:ListBucket` on the `nvidia-gaming` bucket
 - Run PowerShell **as Administrator**
+- If using a custom Windows AMI, it must be Sysprep'd
 
 ## Usage
 
@@ -23,11 +24,26 @@ irm https://raw.githubusercontent.com/phantom-computer/scripts-and-utilities/mai
 ## What it does
 
 1. Downloads all files under `s3://nvidia-gaming/windows/latest/` to `%USERPROFILE%\Desktop\NVIDIA`
-2. Locates the `.exe` installer in the downloaded files
-3. Runs a **silent install** with `-s -noreboot -noeula -clean Display.Driver` (core display driver only, no GeForce Experience)
-4. Reports success or prompts for reboot as needed
+2. Runs a **silent install** with `-s -noreboot -noeula -clean Display.Driver` (core display driver only, no GeForce Experience)
+3. Downloads the correct **GridSwCert** license file based on the installed driver version and saves it to `%PUBLIC%\Documents\GridSwCert.txt`
+4. Reboots the instance to complete installation
+
+## Verifying the license (after reboot)
+
+```powershell
+$NvidiaSmi = Get-ChildItem -Path "C:\" -Recurse -Filter "nvidia-smi.exe" | Select-Object -First 1
+& $NvidiaSmi.FullName -q
+```
+
+Look for:
+```
+vGPU Software Licensed Product
+    Product Name : NVIDIA Cloud Gaming
+    License Status : Licensed (Expiry: N/A)
+```
 
 ## Notes
 
-- A reboot is recommended after installation even if not strictly required.
-- To include GeForce Experience, remove `Display.Driver` from `$InstallArgs` and replace with an empty string or desired components.
+- To download all available driver versions instead of just the latest, change `$KeyPrefix` from `"windows/latest"` to `"windows"`.
+- To include GeForce Experience, remove `Display.Driver` from `$InstallArgs`.
+- Optional: set up [Amazon DCV](https://docs.aws.amazon.com/dcv/) for up to 4K single display support.
