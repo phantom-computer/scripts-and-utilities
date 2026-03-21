@@ -143,7 +143,7 @@ for term in data.get('terms',{}).get('OnDemand',{}).values():
 
 # ── CloudTrail: build runtime hours per instance type ─────────────────────────
 build_runtime() {
-  local instance_id="$1" cur_type="$2" cur_state="$3"
+  local instance_id="$1" cur_type="$2" cur_state="$3" launch_time="$4"
 
   # Lookback 90 days before month start
   local lookback
@@ -176,13 +176,17 @@ build_runtime() {
   done
 
   # Parse events, filter relevant ones, sort by time, reconstruct timeline
-  python3 - "$instance_id" "$cur_type" "$cur_state" "$PERIOD_START" "$PERIOD_END" << 'PYEOF'
+  python3 - "$instance_id" "$cur_type" "$cur_state" "$PERIOD_START" "$PERIOD_END" "$launch_time" << 'PYEOF'
 import json, sys
 from datetime import datetime, timezone, timedelta
 
 instance_id, cur_type, cur_state = sys.argv[1], sys.argv[2], sys.argv[3]
-start = datetime.fromisoformat(sys.argv[4].replace("Z","+00:00"))
-end   = datetime.fromisoformat(sys.argv[5].replace("Z","+00:00"))
+start       = datetime.fromisoformat(sys.argv[4].replace("Z","+00:00"))
+end         = datetime.fromisoformat(sys.argv[5].replace("Z","+00:00"))
+launch_time = datetime.fromisoformat(sys.argv[6])
+if launch_time.tzinfo is None:
+    launch_time = launch_time.replace(tzinfo=timezone.utc)
+launch_time = launch_time.astimezone(timezone.utc)
 
 raw = sys.stdin.read().strip()
 events_raw = json.loads(raw) if raw else []
@@ -211,19 +215,30 @@ for e in events_raw:
 
 timeline.sort(key=lambda x: x[0])
 
-# Replay pre-month to establish state
-cur_running = (cur_state == "running")
 ct = cur_type
-for ts, action, val in timeline:
-    if ts >= start: break
-    if action == "start": cur_running = True
-    elif action == "stop": cur_running = False
-    elif action == "type_change": ct = val
+
+# If the instance launched after month start, it couldn't have been running
+# at month start — use LaunchTime as the effective period start and treat
+# the instance as stopped until we see the first StartInstances event.
+if launch_time > start:
+    effective_start = launch_time
+    cur_running     = False
+else:
+    # Replay pre-month events to establish state at month start.
+    # Fall back to current_state only for instances older than our
+    # 90-day CloudTrail lookback window.
+    effective_start = start
+    cur_running     = (cur_state == "running")
+    for ts, action, val in timeline:
+        if ts >= start: break
+        if action == "start": cur_running = True
+        elif action == "stop": cur_running = False
+        elif action == "type_change": ct = val
 
 hours_by_type = {}
-cur_ts = start
+cur_ts = effective_start
 for ts, action, val in timeline:
-    if ts < start: continue
+    if ts < effective_start: continue
     if ts >= end: break
     if cur_running:
         delta = (ts - cur_ts).total_seconds() / 3600
@@ -299,13 +314,14 @@ report_instance() {
     --query 'Reservations[0].Instances[0]' \
     --output json 2>/dev/null)
 
-  local cur_type cur_state platform name owner inst_uuid
+  local cur_type cur_state platform name owner inst_uuid launch_time
   cur_type=$(echo "$inst_json" | jq -r '.InstanceType')
   cur_state=$(echo "$inst_json" | jq -r '.State.Name')
   platform=$(echo "$inst_json" | jq -r '.Platform // "linux"')
   name=$(echo "$inst_json" | jq -r '(.Tags // []) | map(select(.Key=="Name")) | .[0].Value // "'$instance_id'"')
   owner=$(echo "$inst_json" | jq -r '(.Tags // []) | map(select(.Key=="Owner")) | .[0].Value // "—"')
   inst_uuid=$(echo "$inst_json" | jq -r '(.Tags // []) | map(select(.Key=="InstanceUUID")) | .[0].Value // "—"')
+  launch_time=$(echo "$inst_json" | jq -r '.LaunchTime')
 
   local os_type="${OS_OVERRIDE:-$platform}"
 
@@ -324,7 +340,7 @@ report_instance() {
 
   local total_runtime_cost=0
   local runtime_lines
-  runtime_lines=$(build_runtime "$instance_id" "$cur_type" "$cur_state" <<< "")
+  runtime_lines=$(build_runtime "$instance_id" "$cur_type" "$cur_state" "$launch_time" <<< "")
 
   while IFS=' ' read -r itype hours; do
     [[ -z "$itype" ]] && continue
