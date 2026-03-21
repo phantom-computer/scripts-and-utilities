@@ -3,7 +3,7 @@
 #
 # Set $Bucket and $KeyPrefix to match your S3 layout before running.
 
-$Bucket    = "<your-s3-bucket>"
+$Bucket    = "nvidia-gaming"
 $KeyPrefix = "windows/latest"
 $LocalPath = "$home\Desktop\NVIDIA"
 

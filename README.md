@@ -5,12 +5,11 @@ Downloads the latest NVIDIA Gaming driver from an S3 bucket and silently install
 ## Prerequisites
 
 - [AWS Tools for PowerShell](https://aws.amazon.com/powershell/) installed and configured
-- IAM credentials with `s3:GetObject` and `s3:ListBucket` on your driver bucket
+- IAM credentials with `s3:GetObject` and `s3:ListBucket` on the `nvidia-gaming` bucket
 - Run PowerShell **as Administrator**
 
 ## Setup
 
-Edit `Install-NvidiaDriver.ps1` and set `$Bucket` to your S3 bucket name before running.
 
 ## Usage
 
