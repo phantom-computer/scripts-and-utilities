@@ -243,21 +243,41 @@ else:
         elif action == "type_change": ct = val
 
 hours_by_type = {}
+warnings      = []
 cur_ts = effective_start
 for ts, action, val in timeline:
     if ts < effective_start: continue
     if ts >= end:            break
-    if cur_running:
-        delta = (ts - cur_ts).total_seconds() / 3600
-        hours_by_type[ct] = hours_by_type.get(ct, 0.0) + delta
-    cur_ts = ts
-    if action == "start":        cur_running = True
-    elif action == "stop":       cur_running = False
-    elif action == "type_change": ct = val
+    if action == "start":
+        if cur_running:
+            # AWS rejects StartInstances on a running instance — a second start
+            # means a stop event is missing from CloudTrail. Don't count the gap.
+            warnings.append(
+                f"  [warn] Missing stop before {ts.strftime('%Y-%m-%d %H:%M UTC')}; "
+                f"gap {cur_ts.strftime('%H:%M')}→{ts.strftime('%H:%M')} not counted"
+            )
+            cur_ts = ts
+        else:
+            cur_ts      = ts
+            cur_running = True
+    elif action == "stop":
+        if cur_running:
+            delta = (ts - cur_ts).total_seconds() / 3600
+            hours_by_type[ct] = hours_by_type.get(ct, 0.0) + delta
+        cur_running = False
+    elif action == "type_change":
+        if cur_running:
+            delta = (ts - cur_ts).total_seconds() / 3600
+            hours_by_type[ct] = hours_by_type.get(ct, 0.0) + delta
+            cur_ts = ts
+        ct = val
 
 if cur_running:
     delta = (end - cur_ts).total_seconds() / 3600
     hours_by_type[ct] = hours_by_type.get(ct, 0.0) + delta
+
+import sys
+for w in warnings: print(w, file=sys.stderr)
 
 for itype, hours in sorted(hours_by_type.items()):
     print(f"{itype} {hours:.4f}")

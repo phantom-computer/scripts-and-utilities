@@ -219,6 +219,7 @@ def build_runtime_by_type(instance_id, current_type, current_state, start, end, 
                 cur_type = val
 
     hours_by_type = {}
+    warnings      = []
     cur_ts = effective_start
 
     for ts, action, val in timeline:
@@ -226,20 +227,38 @@ def build_runtime_by_type(instance_id, current_type, current_state, start, end, 
             continue
         if ts >= end:
             break
-        if cur_running:
-            delta = (ts - cur_ts).total_seconds() / 3600
-            hours_by_type[cur_type] = hours_by_type.get(cur_type, 0.0) + delta
-        cur_ts = ts
+
         if action == "start":
-            cur_running = True
+            if cur_running:
+                # AWS rejects StartInstances on a running instance, so a second
+                # start means a stop event is missing from CloudTrail.
+                # Don't count the ambiguous gap — reset to this new start time.
+                warnings.append(
+                    f"  [warn] Missing stop event before {ts.strftime('%Y-%m-%d %H:%M UTC')}; "
+                    f"gap {cur_ts.strftime('%H:%M')}→{ts.strftime('%H:%M')} not counted"
+                )
+                cur_ts = ts
+            else:
+                cur_ts      = ts
+                cur_running = True
         elif action == "stop":
+            if cur_running:
+                delta = (ts - cur_ts).total_seconds() / 3600
+                hours_by_type[cur_type] = hours_by_type.get(cur_type, 0.0) + delta
             cur_running = False
         elif action == "type_change":
+            if cur_running:
+                delta = (ts - cur_ts).total_seconds() / 3600
+                hours_by_type[cur_type] = hours_by_type.get(cur_type, 0.0) + delta
+                cur_ts = ts
             cur_type = val
 
     if cur_running:
         delta = (end - cur_ts).total_seconds() / 3600
         hours_by_type[cur_type] = hours_by_type.get(cur_type, 0.0) + delta
+
+    for w in warnings:
+        print(w, file=__import__('sys').stderr)
 
     return hours_by_type
 
