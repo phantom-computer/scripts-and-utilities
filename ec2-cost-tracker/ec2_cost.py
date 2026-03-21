@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """
-ec2_cost.py - Monthly cost breakdown for an EC2 instance.
+ec2_cost.py - Monthly cost breakdown for EC2 instance(s).
 
-Calculates:
-  - Runtime hours per instance type (handles mid-month type changes via CloudTrail)
-  - Egress bandwidth cost (CloudWatch NetworkOut)
-  - EBS storage cost (per volume, per type)
+Can target a single instance or all instances matching a tag filter.
 
 Usage:
-  python3 ec2_cost.py --instance-id i-0abc1234567890 [--month 2026-03] [--region us-east-1] [--os linux]
+  # Single instance
+  python3 ec2_cost.py --instance-id i-0abc1234567890
+
+  # All instances owned by a user (UUID in Owner tag)
+  python3 ec2_cost.py --tag-value 94682438-4091-706e-4193-1b79bdc3d3da
+
+  # Custom tag key
+  python3 ec2_cost.py --tag-key user_id --tag-value <uuid>
+
+  # With options
+  python3 ec2_cost.py --tag-value <uuid> --month 2026-03 --region us-east-1
 
 Required IAM permissions:
   cloudtrail:LookupEvents, cloudwatch:GetMetricStatistics,
@@ -63,6 +70,30 @@ def get_month_bounds(month_str):
     return start, min(end, datetime.now(timezone.utc))
 
 
+def find_instances_by_tag(ec2_client, tag_key, tag_value):
+    """Return list of instance dicts matching the given tag key/value."""
+    resp = ec2_client.describe_instances(
+        Filters=[{"Name": f"tag:{tag_key}", "Values": [tag_value]}]
+    )
+    instances = []
+    for res in resp["Reservations"]:
+        for inst in res["Instances"]:
+            instances.append(inst)
+    return instances
+
+
+def get_instance(ec2_client, instance_id):
+    resp = ec2_client.describe_instances(InstanceIds=[instance_id])
+    return resp["Reservations"][0]["Instances"][0]
+
+
+def get_tag(instance, key, default=""):
+    for t in (instance.get("Tags") or []):
+        if t["Key"] == key:
+            return t["Value"]
+    return default
+
+
 def get_cloudtrail_events(ct_client, instance_id, start, end):
     events = []
     kwargs = {
@@ -80,13 +111,11 @@ def get_cloudtrail_events(ct_client, instance_id, start, end):
     return events
 
 
-def get_instance_type_price(instance_type, region, os_type):
-    """Query AWS Pricing API for on-demand hourly price. Returns None if not found."""
+def get_instance_type_price(pricing_client, instance_type, region, os_type):
     location = REGION_LOCATION_MAP.get(region, "US East (N. Virginia)")
     os_name  = "Windows" if os_type.lower() == "windows" else "Linux"
-    pricing  = boto3.client("pricing", region_name="us-east-1")
     try:
-        resp = pricing.get_products(
+        resp = pricing_client.get_products(
             ServiceCode="AmazonEC2",
             Filters=[
                 {"Type": "TERM_MATCH", "Field": "instanceType",    "Value": instance_type},
@@ -114,11 +143,6 @@ def get_instance_type_price(instance_type, region, os_type):
 # ── Core calculations ─────────────────────────────────────────────────────────
 
 def build_runtime_by_type(instance_id, current_type, current_state, start, end, region):
-    """
-    Reconstruct running hours per instance type using CloudTrail.
-    Looks back 90 days before month start to establish initial state/type.
-    Returns: {"g4dn.xlarge": 312.5, ...}
-    """
     ct = boto3.client("cloudtrail", region_name=region)
     lookback_start = start - timedelta(days=90)
     all_events = get_cloudtrail_events(ct, instance_id, lookback_start, end)
@@ -129,13 +153,11 @@ def build_runtime_by_type(instance_id, current_type, current_state, start, end, 
         key=lambda e: e["EventTime"]
     )
 
-    # Normalize timestamps to UTC
     def to_utc(ts):
         if ts.tzinfo is None:
             return ts.replace(tzinfo=timezone.utc)
         return ts.astimezone(timezone.utc)
 
-    # Build timeline: (timestamp, action, value)
     timeline = []
     for e in events:
         name   = e["EventName"]
@@ -152,7 +174,6 @@ def build_runtime_by_type(instance_id, current_type, current_state, start, end, 
             if new_type:
                 timeline.append((ts, "type_change", new_type))
 
-    # Replay pre-month events to find state/type at month start
     cur_type    = current_type
     cur_running = current_state == "running"
 
@@ -166,7 +187,6 @@ def build_runtime_by_type(instance_id, current_type, current_state, start, end, 
         elif action == "type_change":
             cur_type = val
 
-    # Walk in-month events and accumulate hours per type
     hours_by_type = {}
     cur_ts = start
 
@@ -186,7 +206,6 @@ def build_runtime_by_type(instance_id, current_type, current_state, start, end, 
         elif action == "type_change":
             cur_type = val
 
-    # Account for remaining time to end of period
     if cur_running:
         delta = (end - cur_ts).total_seconds() / 3600
         hours_by_type[cur_type] = hours_by_type.get(cur_type, 0.0) + delta
@@ -195,7 +214,6 @@ def build_runtime_by_type(instance_id, current_type, current_state, start, end, 
 
 
 def get_network_out_gb(instance_id, start, end, region):
-    """Sum CloudWatch NetworkOut and return total GB."""
     cw   = boto3.client("cloudwatch", region_name=region)
     resp = cw.get_metric_statistics(
         Namespace="AWS/EC2",
@@ -212,7 +230,6 @@ def get_network_out_gb(instance_id, start, end, region):
 
 
 def get_ebs_volumes(instance_id, region):
-    """Return list of dicts for all EBS volumes attached to the instance."""
     ec2  = boto3.client("ec2", region_name=region)
     resp = ec2.describe_volumes(
         Filters=[{"Name": "attachment.instance-id", "Values": [instance_id]}]
@@ -231,49 +248,36 @@ def get_ebs_volumes(instance_id, region):
         })
     return results
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Per-instance report ───────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(description="EC2 monthly cost breakdown")
-    parser.add_argument("--instance-id", required=True, help="EC2 instance ID (i-xxxx)")
-    parser.add_argument("--month",  default=datetime.now(timezone.utc).strftime("%Y-%m"),
-                        help="Month to analyze, YYYY-MM (default: current month)")
-    parser.add_argument("--region", default="us-east-1")
-    parser.add_argument("--os",     default=None,
-                        help="linux or windows (auto-detected from instance if omitted)")
-    args = parser.parse_args()
-
-    ec2_client   = boto3.client("ec2", region_name=args.region)
-    start, end   = get_month_bounds(args.month)
-
-    try:
-        resp = ec2_client.describe_instances(InstanceIds=[args.instance_id])
-        inst = resp["Reservations"][0]["Instances"][0]
-    except (ClientError, IndexError) as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
+def report_instance(inst, start, end, region, os_override, pricing_client):
+    instance_id   = inst["InstanceId"]
     current_type  = inst["InstanceType"]
     current_state = inst["State"]["Name"]
-    os_type       = args.os or inst.get("Platform", "linux")
+    os_type       = os_override or inst.get("Platform", "linux")
+    name          = get_tag(inst, "Name", instance_id)
+    owner         = get_tag(inst, "Owner", "—")
+    inst_uuid     = get_tag(inst, "InstanceUUID", "—")
 
-    print(f"\n{'='*64}")
-    print(f"  EC2 Cost Report  |  {args.instance_id}")
-    print(f"  Period : {start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d %H:%M')} UTC")
-    print(f"  State  : {current_state}  |  Type: {current_type}  |  OS: {os_type}")
-    print(f"{'='*64}\n")
+    print(f"\n{'='*68}")
+    print(f"  {name}  ({instance_id})")
+    print(f"  Owner : {owner}")
+    if inst_uuid != "—":
+        print(f"  UUID  : {inst_uuid}")
+    print(f"  State : {current_state}  |  Type: {current_type}  |  OS: {os_type}")
+    print(f"  Period: {start.strftime('%Y-%m-%d')} → {end.strftime('%Y-%m-%d %H:%M')} UTC")
+    print(f"{'='*68}\n")
 
-    # ── Runtime ──────────────────────────────────────────────────────────────
+    # Runtime
     print("RUNTIME")
     print(f"  {'Instance Type':<22} {'Hours':>8}  {'Rate':>14}  {'Cost':>10}")
     print(f"  {'-'*22} {'-'*8}  {'-'*14}  {'-'*10}")
-
     hours_by_type = build_runtime_by_type(
-        args.instance_id, current_type, current_state, start, end, args.region
+        instance_id, current_type, current_state, start, end, region
     )
     total_runtime_cost = 0.0
     for itype, hours in sorted(hours_by_type.items()):
-        price = get_instance_type_price(itype, args.region, os_type)
+        price = get_instance_type_price(pricing_client, itype, region, os_type)
         cost  = hours * price if price else 0.0
         total_runtime_cost += cost
         rate_str = f"${price:.4f}/hr" if price else "N/A"
@@ -281,9 +285,9 @@ def main():
     print(f"  {'-'*22} {'-'*8}  {'-'*14}  {'-'*10}")
     print(f"  {'TOTAL':<22} {'':>8}  {'':>14}  ${total_runtime_cost:>9.2f}\n")
 
-    # ── Egress ───────────────────────────────────────────────────────────────
+    # Egress
     print("EGRESS (NetworkOut)")
-    total_gb    = get_network_out_gb(args.instance_id, start, end, args.region)
+    total_gb    = get_network_out_gb(instance_id, start, end, region)
     billable_gb = max(0.0, total_gb - EGRESS_FREE_GB)
     egress_cost = billable_gb * EGRESS_COST_PER_GB
     print(f"  Total transfer : {total_gb:>10.3f} GB")
@@ -291,11 +295,11 @@ def main():
     print(f"  Billable       : {billable_gb:>10.3f} GB  @  ${EGRESS_COST_PER_GB}/GB")
     print(f"  {'Cost':<36}  ${egress_cost:>9.2f}\n")
 
-    # ── EBS ──────────────────────────────────────────────────────────────────
+    # EBS
     print("EBS STORAGE")
     print(f"  {'Volume ID':<24} {'Type':<8} {'Size':>8}  {'Rate':>13}  {'Cost':>10}")
     print(f"  {'-'*24} {'-'*8} {'-'*8}  {'-'*13}  {'-'*10}")
-    volumes        = get_ebs_volumes(args.instance_id, args.region)
+    volumes        = get_ebs_volumes(instance_id, region)
     total_ebs_cost = 0.0
     for v in volumes:
         rate_str = f"${v['price_per_gb']:.3f}/GB-mo"
@@ -304,15 +308,62 @@ def main():
     print(f"  {'-'*24} {'-'*8} {'-'*8}  {'-'*13}  {'-'*10}")
     print(f"  {'TOTAL':<56}  ${total_ebs_cost:>9.2f}\n")
 
-    # ── Summary ──────────────────────────────────────────────────────────────
     grand_total = total_runtime_cost + egress_cost + total_ebs_cost
-    print(f"{'='*64}")
     print(f"  Runtime  : ${total_runtime_cost:>9.2f}")
     print(f"  Egress   : ${egress_cost:>9.2f}")
     print(f"  EBS      : ${total_ebs_cost:>9.2f}")
     print(f"  {'-'*38}")
     print(f"  TOTAL    : ${grand_total:>9.2f}")
-    print(f"{'='*64}\n")
+
+    return grand_total
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="EC2 monthly cost breakdown")
+
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--instance-id",  help="Single EC2 instance ID (i-xxxx)")
+    target.add_argument("--tag-value",    help="Filter all instances by tag value (UUID)")
+
+    parser.add_argument("--tag-key",  default="Owner",
+                        help="Tag key to filter on when using --tag-value (default: Owner)")
+    parser.add_argument("--month",    default=datetime.now(timezone.utc).strftime("%Y-%m"),
+                        help="Month to analyze, YYYY-MM (default: current month)")
+    parser.add_argument("--region",   default="us-east-1")
+    parser.add_argument("--os",       default=None,
+                        help="linux or windows (auto-detected from instance if omitted)")
+    args = parser.parse_args()
+
+    ec2_client     = boto3.client("ec2",     region_name=args.region)
+    pricing_client = boto3.client("pricing", region_name="us-east-1")
+    start, end     = get_month_bounds(args.month)
+
+    if args.instance_id:
+        try:
+            inst = get_instance(ec2_client, args.instance_id)
+        except (ClientError, IndexError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        instances = [inst]
+    else:
+        instances = find_instances_by_tag(ec2_client, args.tag_key, args.tag_value)
+        if not instances:
+            print(f"No instances found with tag {args.tag_key}={args.tag_value}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Found {len(instances)} instance(s) with {args.tag_key}={args.tag_value}")
+
+    grand_totals = []
+    for inst in instances:
+        total = report_instance(inst, start, end, args.region, args.os, pricing_client)
+        grand_totals.append(total)
+
+    if len(instances) > 1:
+        print(f"\n{'#'*68}")
+        print(f"  ACCOUNT TOTAL for {args.tag_key}={args.tag_value}")
+        print(f"  {len(instances)} instance(s)  |  {args.month}")
+        print(f"  TOTAL : ${sum(grand_totals):>9.2f}")
+        print(f"{'#'*68}\n")
 
 
 if __name__ == "__main__":
