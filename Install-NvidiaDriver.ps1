@@ -2,6 +2,42 @@
 # Downloads the latest NVIDIA Gaming driver from S3, silently installs it,
 # registers the GridSwCert license, and verifies the install.
 
+# ── Licence cert by driver version ───────────────────────────────────────────
+# Windows ranges from AWS "Install NVIDIA gaming drivers" (checked 2026-10-18):
+#   591.59 or later  -> GridSwCert_2026_03_02.cert
+#   576.80 – 581.80  -> GridSwCertWindows_2025_07_01.cert
+#   460.39 – 576.72  -> GridSwCertWindows_2024_02_22.cert
+#   445.87           -> GridSwCert-Windows_2020_04.cert
+#   earlier          -> GridSwCert-Windows_2019_09.cert
+# AWS publishes no Windows gaming build in the gaps (576.73–576.79, 581.81–591.58); a build
+# there takes the cert of the nearest lower range, with a warning.
+$script:GridSwCertBase   = "https://nvidia-gaming.s3.amazonaws.com/GridSwCert-Archive"
+$script:GridSwCertLatest = "$script:GridSwCertBase/GridSwCert_2026_03_02.cert"
+
+function Get-GridSwCertUrl([version]$Version) {
+    if ($Version -ge [version]"591.59") { return $script:GridSwCertLatest }
+    if ($Version -gt [version]"581.80") {
+        Write-Warning "Driver $Version is between documented cert ranges; using the 2025-07-01 cert."
+        return "$script:GridSwCertBase/GridSwCertWindows_2025_07_01.cert"
+    }
+    if ($Version -ge [version]"576.80") { return "$script:GridSwCertBase/GridSwCertWindows_2025_07_01.cert" }
+    if ($Version -gt [version]"576.72") {
+        Write-Warning "Driver $Version is between documented cert ranges; using the 2024-02-22 cert."
+        return "$script:GridSwCertBase/GridSwCertWindows_2024_02_22.cert"
+    }
+    if ($Version -ge [version]"460.39") { return "$script:GridSwCertBase/GridSwCertWindows_2024_02_22.cert" }
+    if ($Version -ge [version]"445.87") { return "$script:GridSwCertBase/GridSwCert-Windows_2020_04.cert" }
+    return "$script:GridSwCertBase/GridSwCert-Windows_2019_09.cert"
+}
+
+function Get-DriverVersionFromInstaller([string]$FileName) {
+    if ($FileName -match '^(\d+\.\d+)_') { return [version]$Matches[1] }
+    return $null
+}
+
+# Dot-sourcing (". .\Install-NvidiaDriver.ps1") only loads the functions above (used by tests).
+if ($MyInvocation.InvocationName -eq '.') { return }
+
 $Bucket    = "nvidia-gaming"
 $KeyPrefix = "windows/latest"
 $LocalPath = "$home\Desktop\NVIDIA"
@@ -59,27 +95,27 @@ if ($Process.ExitCode -eq 0) {
 # ── Step 3: Register the GridSwCert license ──────────────────────────────────
 Write-Host "Downloading NVIDIA Gaming license certificate..."
 
-# Determine driver version to select the correct cert
-$NvidiaSmi = Get-ChildItem -Path "C:\" -Recurse -Filter "nvidia-smi.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-$CertUrl = $null
-
-if ($NvidiaSmi) {
-    $VersionOutput = & $NvidiaSmi.FullName --query-gpu=driver_version --format=csv,noheader 2>$null
-    $DriverVersion = [version]($VersionOutput.Trim().Split(" ")[0])
-
-    if ($DriverVersion -ge [version]"591.59") {
-        $CertUrl = "https://nvidia-gaming.s3.amazonaws.com/GridSwCert-Archive/GridSwCert_2026_03_02.cert"
-    } elseif ($DriverVersion -ge [version]"460.39") {
-        $CertUrl = "https://nvidia-gaming.s3.amazonaws.com/GridSwCert-Archive/GridSwCertWindows_2024_02_22.cert"
-    } elseif ($DriverVersion -ge [version]"445.87") {
-        $CertUrl = "https://nvidia-gaming.s3.amazonaws.com/GridSwCert-Archive/GridSwCert-Windows_2020_04.cert"
-    } else {
-        $CertUrl = "https://nvidia-gaming.s3.amazonaws.com/GridSwCert-Archive/GridSwCert-Windows_2019_09.cert"
+# Determine driver version to select the correct cert.
+# Prefer the version in the installer filename (e.g. 616.92_Cloud_Gaming_...exe): it is
+# the driver we just installed, needs no reboot, and avoids picking a stale nvidia-smi.exe
+# from an older DriverStore folder. Fall back to nvidia-smi only if the name doesn't parse.
+$DriverVersion = Get-DriverVersionFromInstaller $Installer.Name
+if (-not $DriverVersion) {
+    $NvidiaSmi = Get-ChildItem -Path "$Env:SystemRoot\System32\DriverStore\FileRepository" -Recurse -Filter "nvidia-smi.exe" -ErrorAction SilentlyContinue |
+                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($NvidiaSmi) {
+        $VersionOutput = & $NvidiaSmi.FullName --query-gpu=driver_version --format=csv,noheader 2>$null
+        $DriverVersion = [version]($VersionOutput.Trim().Split(" ")[0])
     }
+}
+
+if ($DriverVersion) {
+    Write-Host "  Driver version: $DriverVersion"
+    $CertUrl = Get-GridSwCertUrl $DriverVersion
 } else {
     # Default to latest cert if driver version can't be determined yet
-    Write-Host "  nvidia-smi not found yet — using latest cert (driver may need reboot first)."
-    $CertUrl = "https://nvidia-gaming.s3.amazonaws.com/GridSwCert-Archive/GridSwCert_2026_03_02.cert"
+    Write-Host "  Driver version unknown — using latest cert (driver may need reboot first)."
+    $CertUrl = $script:GridSwCertLatest
 }
 
 $CertDest = "$Env:PUBLIC\Documents\GridSwCert.txt"
